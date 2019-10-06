@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+
+###
+# Copyright:
+#  Do what you want with the code. Just don't hold me responsible
+#  for any damages. If you use this program or parts of it and you
+#  feel generous, include me in the credits. Email me if you find
+#  this program useful or if you find bugs. :-)
+# Author: Gautam Gopalakrishnan
+# Email:  ldifsearch  AAAATTT ggop DDOOTT net
+#
+# Change History:
+# July 2006; Initial release
+# 20 Dec 2007; Mixed case attributes fetched properly
+###
+
+# Version 0.1
+
+use Net::LDAP::LDIF;
+use Net::LDAP::Filter;
+use Getopt::Long;
+use Text::ParseWords;
+
+use strict;
+no strict 'refs';
+use warnings;
+
+# Commandline options
+my ($opt_infile, $opt_outfile, $opt_join, $opt_base, $opt_scope);
+
+# Default file to examine is stdin
+$opt_infile = "-";
+
+# Default output file is stdout
+$opt_outfile = "-";
+
+usage() unless GetOptions(
+		'f=s' => \$opt_infile,
+		'o=s' => \$opt_outfile,
+		'j'   => \$opt_join,
+		'b=s' => \$opt_base,
+		's=s' => \$opt_scope,
+		);
+
+usage() unless (@ARGV);
+
+my ($filter, @disp_attrs) = @ARGV;
+
+# Get a hash of required attributes so easier to print later
+my %disp_attrs;
+$disp_attrs{lc $_} = 1 foreach (@disp_attrs);
+
+$filter = Net::LDAP::Filter->new($filter);
+die "Bad filter\n" unless ($filter);
+
+if ($opt_scope && not $opt_base) {
+	print "Scope must be specified with a base\n";
+	usage();
+}
+
+if ($opt_base =~ /^\s*$/) {
+	print "Base must not be empty\n";
+	usage();
+}
+
+if ($opt_base && not $opt_scope) {
+	$opt_scope = "sub";
+}
+
+if ($opt_scope !~ /^(sub|one|base)$/i) {
+	print "Invalid scope '$opt_scope'\n";
+	usage();
+}
+$opt_scope = lc $opt_scope;
+
+my $writer = Net::LDAP::LDIF->new(
+		$opt_outfile, 'w',
+		'encode' => 'base64',
+		'wrap'   => $opt_join ? 0 : 78,
+	)
+	or die "Unable to open stdout for writing\n";
+
+my $ldif = Net::LDAP::LDIF->new($opt_infile, 'r')
+	or die "Unable to open $opt_infile: $!\n";
+
+my ($opt_base_n);
+if ($opt_base) {
+	# Split the string and join it back with no space after the comma.
+	# This makes it easier to check with each entry's dn
+	my (@parts);
+	@parts = quotewords(',\s*', 0, $opt_base);
+	$opt_base = join(",", @parts); 
+	$opt_base_n = scalar @parts;
+}
+
+ENTRY: while(not $ldif->eof()) {
+	my $entry = $ldif->read_entry();
+	if ($ldif->error()) {
+		print "Error msg: ", $ldif->error(), "\n";
+		print "Error lines:\n", $ldif->error_lines(), "\n";
+		next ENTRY;
+	}
+
+	if ($opt_base) {
+		my ($dn, $dn_n, @parts);
+		@parts = quotewords(',\s*', 0, $entry->dn());
+		$dn = join(",", @parts);
+		$dn_n = scalar @parts;
+
+		# Skip entry unless the base matches the end of the dn
+		next ENTRY unless ($dn =~ /,$opt_base$/i);
+
+		if ($opt_scope eq "sub") {
+			# Do nothing
+		}
+		elsif ($opt_scope eq "base") {
+			next ENTRY unless ($dn_n == $opt_base_n);
+		}
+		elsif ($opt_scope eq "one") {
+			next ENTRY unless (($dn_n - $opt_base_n) == 1);
+		}
+	}
+
+	next ENTRY unless apply_filter($entry, $filter);
+
+	if (@disp_attrs) {
+		foreach my $attr ($entry->attributes) {
+			$entry->delete($attr) unless $disp_attrs{lc $attr};
+		}
+	}
+	$writer->write_entry($entry);
+}
+$ldif->done();
+$writer->done();
+
+exit 0;
+
+sub usage {
+	print <<"EOF";
+Usage: $0 [options] <filter> [attributes]
+Options:
+   -f <filename> - Input file name (default is yyyy_mm_dd_000000.ldif)
+   -o <filename> - Output file name (will be overwritten if it exists, default is stdout)
+   -j            - Join lines (turn off wrapping the output)
+   -b <base>     - Set the base for this search
+   -s <scope>    - Set the scope (allowed values are base, one, sub)
+EOF
+	exit 1;
+}
+
+
+sub apply_filter {
+	my ($entry, $filter) = @_;
+	my ($func, $ref) = %{$filter};
+	return &{"__$func"}($entry, $ref);
+}
+
+
+sub __equalityMatch {
+	my ($entry, $ref) = @_;
+	die "__equalityMatch: ref is not a HASH\n" if (ref($ref) ne "HASH");
+
+	my ($key, $val);
+	$key = lc $ref->{'attributeDesc'};
+	$val = lc $ref->{'assertionValue'};
+	return grep {lc $_ eq $val} $entry->get_value($key);
+}
+
+
+sub __and {
+	my ($entry, $ref) = @_;
+	die "__and: ref is not an ARRAY\n" if (ref($ref) ne "ARRAY");
+	
+	my $ret = 0;
+	foreach my $cond (@{ $ref }) {
+		my ($op, $r) = %{ $cond };
+		$ret = &{"__$op"}($entry, $r);
+		return 0 unless ($ret);
+	}
+	return 1;
+}
+
+
+sub __not {
+	my ($entry, $ref) = @_;
+	die "__not: ref is not a HASH\n" if (ref($ref) ne "HASH");
+
+	my ($key, $val) = %{ $ref };
+	my $ret;
+	$ret = &{"__$key"}($entry, $val);
+	$ret = ($ret > 0) ? 0 : 1;
+	return $ret;
+}
+
+sub __or {
+	my ($entry, $ref) = @_;
+	die "__or: ref is not an ARRAY\n" if (ref($ref) ne "ARRAY");
+	
+	my $ret = 0;
+	foreach my $cond (@{ $ref }) {
+		my ($op, $r) = %{ $cond };
+		$ret = &{"__$op"}($entry, $r);
+		return 1 if ($ret);
+	}
+	return 0;
+}
+
+
+sub __present {
+	my ($entry, $attr) = @_;
+	return scalar $entry->get_value($attr);
+}
+
+
+sub __substrings {
+	my ($entry, $ref) = @_;
+	die "__substrings: Invalid ref type passed\n" unless (ref($ref) eq "HASH");
+
+	my ($attr, $val);
+	$attr = $ref->{'type'};
+	return 0 unless (scalar $entry->get_value($attr));
+
+	foreach my $op (@{ $ref->{'substrings'} }) {
+		$val = "^" . $op->{'initial'} if ($op->{'initial'});
+		$val .= ".*?" . $op->{'any'} if (exists $op->{'any'});
+		$val .= $op->{'final'} . '$' if ($op->{'final'});
+	}
+	$val =~ s/(\.\*){2,}/$1/g; # Compress multiple * in filter
+	return grep {/$val/i} $entry->get_value($attr);
+}
+
+
+
